@@ -92,3 +92,188 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import gzip
+import pickle
+import os
+import json
+import pandas as pd
+
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.compose import ColumnTransformer
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    recall_score,
+    f1_score,
+    precision_score,
+    confusion_matrix,
+)
+from sklearn.model_selection import GridSearchCV
+
+# -----------------------------
+# Paso 1: limpieza de datos
+# -----------------------------
+
+def clean_data(df: pd.DataFrame) -> pd.DataFrame:
+    df_copy = df.copy()
+
+    # 1. Renombrar y eliminar columnas
+    if "default payment next month" in df_copy.columns:
+        df_copy.rename(
+            columns={"default payment next month": "default"},
+            inplace=True,
+        )
+    if "ID" in df_copy.columns:
+        df_copy.drop("ID", axis=1, inplace=True)
+
+    # 2. Eliminar NaNs
+    df_copy.dropna(inplace=True)
+
+    # 3. Eliminar registros con información no disponible (valor 0)
+    #    en variables categóricas codificadas: 0 = N/A
+    cols_with_na_code = ["SEX", "EDUCATION", "MARRIAGE"]
+    for col in cols_with_na_code:
+        if col in df_copy.columns:
+            df_copy[col] = pd.to_numeric(df_copy[col], errors="coerce")
+            df_copy = df_copy[df_copy[col] != 0]
+
+    # 4. Recategorizar EDUCATION: valores > 4 -> 4 ("others")
+    if "EDUCATION" in df_copy.columns:
+        df_copy["EDUCATION"] = df_copy["EDUCATION"].where(
+            df_copy["EDUCATION"] <= 4,
+            4,
+        )
+
+    return df_copy
+
+
+# -----------------------------
+# Paso 2: división X / y
+# -----------------------------
+
+def split_xy(df: pd.DataFrame):
+    y = df["default"]
+    X = df.drop("default", axis=1)
+    return X, y
+
+
+# -----------------------------
+# Métricas y matrices de confusión
+# -----------------------------
+
+def precision_metrics(estimator, X, y, dataset_name: str) -> dict:
+    y_pred = estimator.predict(X)
+
+    precision = precision_score(y_true=y, y_pred=y_pred)
+    balanced = balanced_accuracy_score(y_true=y, y_pred=y_pred)
+    recall = recall_score(y_true=y, y_pred=y_pred)
+    f1 = f1_score(y_true=y, y_pred=y_pred)
+
+    return {
+        "type": "metrics",
+        "dataset": dataset_name,
+        "precision": round(precision, 4),
+        "balanced_accuracy": round(balanced, 4),
+        "recall": round(recall, 4),
+        "f1_score": round(f1, 4),
+    }
+
+
+def cm_metrics(estimator, X, y, dataset_name: str) -> dict:
+    """Calcula y formatea la matriz de confusión completa."""
+    y_pred = estimator.predict(X)
+    # [[TN, FP], [FN, TP]]
+    tn, fp, fn, tp = confusion_matrix(y, y_pred).ravel()
+
+    return {
+        "type": "cm_matrix",
+        "dataset": dataset_name,
+        "true_0": {"predicted_0": int(tn), "predicted_1": int(fp)},
+        "true_1": {"predicted_0": int(fn), "predicted_1": int(tp)},
+    }
+
+
+# -----------------------------
+# Main
+# -----------------------------
+
+def main():
+    # Cargar datos
+    data_train_raw = pd.read_csv("files/input/train_data.csv.zip", compression="zip")
+    data_test_raw = pd.read_csv("files/input/test_data.csv.zip", compression="zip")
+
+    # Paso 1: limpieza
+    data_train = clean_data(data_train_raw)
+    data_test = clean_data(data_test_raw)
+    print("Datos limpiados.")
+    # Paso 2: división en X / y
+    X_train, y_train = split_xy(data_train)
+    X_test, y_test = split_xy(data_test)
+    print("Datos divididos en X / y.")
+    # Paso 3: pipeline (one-hot en EDUCATION + RandomForest)
+    categorical_features = ["EDUCATION"]
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False), categorical_features),
+        ],
+        remainder="passthrough",
+    )
+
+    pipeline = Pipeline(
+        steps=[
+            ("preprocessor", preprocessor),
+            ("RandomForest", RandomForestClassifier(random_state=42)),
+        ]
+    )
+    print("Pipeline creado.")
+    # Paso 4: grid search con validación cruzada (balanced_accuracy)
+    param_grid = {
+        "RandomForest__n_estimators": [200],
+        "RandomForest__max_depth": [None],
+        "RandomForest__min_samples_leaf": [2],
+        "RandomForest__min_samples_split": [5],
+        "RandomForest__max_features": ["sqrt"],
+    }
+
+    grid_search = GridSearchCV(
+        estimator=pipeline,
+        param_grid=param_grid,
+        scoring="balanced_accuracy",
+        cv=10,
+        verbose=1,
+        n_jobs=-1,
+    )
+
+    grid_search.fit(X_train, y_train)
+    print("Grid search completado.")
+    # Paso 5: guardar el modelo comprimido
+    os.makedirs("/files/models/", exist_ok=True)
+    model_path = "/files/models/model.pkl.gz"
+    with gzip.open(model_path, "wb") as f:
+        pickle.dump(grid_search, f)
+    print("Modelo guardado en model.pkl.gz.")
+    # Paso 6: métricas de precisión, balanced_accuracy, recall, f1
+    metrics_train = precision_metrics(grid_search, X_train, y_train, "train")
+    metrics_test = precision_metrics(grid_search, X_test, y_test, "test")
+    print("Métricas calculadas.")
+    # Paso 7: matrices de confusión
+    cm_train = cm_metrics(grid_search, X_train, y_train, "train")
+    cm_test = cm_metrics(grid_search, X_test, y_test, "test")
+
+    # Guardar todo en metrics.json, una línea por diccionario
+    output_dir = "/files/output/"
+    os.makedirs(output_dir, exist_ok=True)
+    metrics_file = os.path.join(output_dir, "metrics.json")
+
+    all_metrics = [metrics_train, metrics_test, cm_train, cm_test]
+
+    with open(metrics_file, "w", encoding="utf-8") as f:
+        for metric_dict in all_metrics:
+            f.write(json.dumps(metric_dict) + "\n")
+    print("Métricas guardadas en metrics.json.")
+
+if __name__ == "__main__":
+    main()
